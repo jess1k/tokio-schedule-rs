@@ -154,6 +154,95 @@ pub trait Job: Sized + Sync {
 
         Box::pin(fut)
     }
+
+    /// This method returns Future that cyclic performs the job and the oneshot shutdown sender
+    fn perform_with_shutdown<'a, F, Fut>(
+        self,
+        mut func: F,
+    ) -> (
+        Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
+        tokio::sync::oneshot::Sender<()>,
+    )
+    where
+        Self: Send + 'a,
+        F: FnMut() -> Fut + Send + 'a,
+        Fut: Future<Output = ()> + Send + 'a,
+        <Self::TZ as TimeZone>::Offset: Send + 'a,
+    {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+
+        let fut = async move {
+            while let Some(dur) = self.time_to_sleep() {
+                sleep(dur).await;
+
+                tokio::select! {
+                    _ = sleep(dur) => {
+
+                    }
+                    _ = &mut rx => {
+                        break;
+                    }
+                }
+
+                tokio::select! {
+                    _ = func() => {
+
+                    }
+                    _ = &mut rx => {
+                        break;
+                    }
+                }
+            }
+        };
+
+        (Box::pin(fut), tx)
+    }
+
+    // This method returns Future that cyclic performs the job, the oneshot shutdown sender and the graceful complete oneshot receiver
+    fn perform_with_graceful_shutdown<'a, F, Fut>(
+        self,
+        mut func: F,
+    ) -> (
+        Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )
+    where
+        Self: Send + 'a,
+        F: FnMut() -> Fut + Send + 'a,
+        Fut: Future<Output = ()> + Send + 'a,
+        <Self::TZ as TimeZone>::Offset: Send + 'a,
+    {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let (gf_complete_tx, gf_complete_rx) = tokio::sync::oneshot::channel();
+
+        let fut = async move {
+            while let Some(dur) = self.time_to_sleep() {
+                sleep(dur).await;
+
+                tokio::select! {
+                    _ = sleep(dur) => {
+
+                    }
+                    _ = &mut rx => {
+                        break;
+                    }
+                }
+
+                func().await;
+
+                match rx.try_recv() {
+                    Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        let _ = gf_complete_tx.send(());
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        };
+
+        (Box::pin(fut), tx, gf_complete_rx)
+    }
 }
 
 /// This function creates Every struct.
